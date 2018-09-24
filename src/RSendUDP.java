@@ -1,29 +1,18 @@
-import java.net.DatagramSocket;
+import java.net.DatagramPacket;
 import java.io.*;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
+import java.util.ArrayList;
+
 import edu.utulsa.unet.RSendUDPI;
+import edu.utulsa.unet.UDPSocket;
 
 
 public class RSendUDP implements RSendUDPI
 {
-
-    public void init(String fname)
-    {
-        File file = new File(fname);
-        try
-        {
-            DatagramSocket socket = new DatagramSocket(2024);
-            byte [] fileBuffer = Files.readAllBytes(file.toPath());
-            int fileSize = fileBuffer.length;
-            int packetSize = socket.getSendBufferSize();
-        } catch (IOException e)
-        {
-            e.printStackTrace();
-        }
-    }
 
     /***
      * This method currently functions correctly it has been tested. When pulling sequence number out
@@ -32,23 +21,32 @@ public class RSendUDP implements RSendUDPI
      * @param number the sequence number of this packet
      * @return byte array that is the packet to send.
      */
-    private byte [] packPacket(byte [] data, Integer number)
+    private byte [] packPacket(byte [] data, int number, int flag)
     {
         byte [] tseq = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(number).array();
-        for (byte b:tseq)
-        {
-            System.out.println(b);
-        }
-        System.out.println("\n");
         byte [] seq = new byte[SEQSIZE];
-        int j = 0;
-        for (int i = tseq.length - (tseq.length - SEQSIZE); i < tseq.length; i++, j++)
+        for (int i = tseq.length - (tseq.length - SEQSIZE), j = 0; i < tseq.length; i++, j++)
         {
             seq[j] = tseq[i];
         }
-        byte [] packet = new byte[seq.length + data.length];
-        System.arraycopy(seq, 0, packet, 0, seq.length);
-        System.arraycopy(data, 0, packet, seq.length, data.length);
+        byte [] packet = new byte[seq.length + data.length + 1];
+        switch (flag)
+        {
+            // sending packet to receiver
+            case 0:
+                packet[0] = 0;
+                break;
+            // sending ack to sender
+            case 1:
+                packet[0] = 1;
+                break;
+            // sending last packet to receiver
+            case 2:
+                packet[0] = 2;
+                break;
+        }
+        System.arraycopy(seq, 0, packet, 1, seq.length);
+        System.arraycopy(data, 0, packet, seq.length + 1, data.length);
         return packet;
     }
 
@@ -150,20 +148,86 @@ public class RSendUDP implements RSendUDPI
     @Override
     public boolean sendFile()
     {
-        return false;
+        if (filename == null )//|| receiver == null)
+        {
+            System.out.println("No file or receiver specified.");
+            return false;
+        }
+        File file = new File(filename);
+        try
+        {
+            UDPSocket socket = new UDPSocket(2024);
+
+            // read entire file into byte buffer. This should be changed so you don't have to read the entire file into memory.
+            byte [] fileBuffer = Files.readAllBytes(file.toPath());
+            float fileSize = fileBuffer.length;
+            int dataSize = socket.getSendBufferSize() - SEQSIZE - 1;
+            int numberOfPackets = (int) Math.ceil(fileSize / dataSize);
+            allPackets = new ArrayList<>();
+            for (int i = 0; i < numberOfPackets; i++)
+            {
+                // case 0 where we are at the beginning or the middle of a file
+                if ((i + 1) * (dataSize) <= fileSize)
+                {
+                    byte [] temp = new byte[dataSize];
+                    System.arraycopy(fileBuffer, i * dataSize, temp, 0, temp.length);
+                    allPackets.add(packPacket(temp, i, 0));
+                }
+                // case 1 where this is the last packet of the file
+                else
+                {
+                    byte [] temp = new byte[(int)fileSize - (i * dataSize)];
+                    System.arraycopy(fileBuffer, i * dataSize, temp, 0, temp.length);
+                    allPackets.add(packPacket(temp, i, 0));
+                }
+            }
+            outstandingFrames = (int) ((float)windowSize / packetSize);
+            int headPntr = 0;
+            boolean isReceived = true;
+            while (headPntr < allPackets.size())
+            {
+                for (int i = 0; i < outstandingFrames; i++)
+                {
+                    if (headPntr + i >= numberOfPackets)
+                    {
+                        continue;
+                    }
+                    byte [] temp = allPackets.get(headPntr + i);
+                    socket.send(new DatagramPacket(temp, temp.length, InetAddress.getByName(ip), port));
+                    System.out.println("Sent packet " + i);
+                }
+                byte [] buffer = new byte[ACKSIZE];
+                DatagramPacket ack = new DatagramPacket(buffer, buffer.length);
+                socket.receive(ack);
+                System.out.println("Received ack");
+                if (isReceived)
+                {
+                    ++headPntr;
+                }
+            }
+        }
+        catch (IOException e)
+        {
+            e.printStackTrace();
+            return false;
+        }
+        return true;
     }
 
 
     // Globals:
-    public int mode = 0;
-    public int packetSize;
-    public int port = 12987;
-    public long timeout = 1000;
-    public long windowSize = 256;
-    public int outstandingFrames = 1;
-    public String ip = "localhost";
-    public String filename;
-    public InetSocketAddress receiver;
+    private int mode = 0;
+    private int packetSize;
+    private int port = 12987;
+    private long timeout = 1000;
+    private long windowSize = 256;
+    private int outstandingFrames = 1;
+    private int received = -1;
+    private String ip = "localhost";
+    private String filename = null;
+    private InetSocketAddress receiver = null;
+    private ArrayList<byte []> allPackets = null;
     private final int SEQSIZE = 2;
+    private final int ACKSIZE = 4;
 
 }
