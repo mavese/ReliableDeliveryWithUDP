@@ -1,3 +1,5 @@
+import java.net.InetSocketAddress;
+
 public class Driver
 {
     public static void main(String[] args)
@@ -8,32 +10,20 @@ public class Driver
         RSendUDP sender = new RSendUDP();
         sender.setMode(1);
         sender.setFilename(fname);
+        sender.setModeParameter(100000);
+        sender.setTimeout(50);
+        sender.setReceiver(new InetSocketAddress("localhost", 2024));
         RReceiveUDP rcvr = new RReceiveUDP();
+        rcvr.setLocalPort(2024);
+        rcvr.setFilename("/home/mavese/IdeaProjects/ReliableDeliveryWithUDP/src/gi1.gif");
         new Thread()
         {
             public void run()
             {
                 rcvr.receiveFile();
+                Thread.currentThread().stop();
             }
         }.start();
         sender.sendFile();
-
-//        byte [] buff = ("Hello world").getBytes();
-//        byte [] packet = sender.packPacket(buff, 3, 0);
-//        for (byte b:packet)
-//        {
-//            System.out.println(b);
-//        }
-//        System.out.println("\n");
-//        RReceiveUDP.Packet unpacked = rcvr.unpackPacket(packet);
-//        System.out.println(unpacked.flag);
-//        for (byte b:unpacked.seqNum)
-//        {
-//            System.out.println(b);
-//        }
-//        for (byte b:unpacked.data)
-//        {
-//            System.out.println(b);
-//        }
     }
 }

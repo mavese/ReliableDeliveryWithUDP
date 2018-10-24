@@ -1,13 +1,13 @@
 import edu.utulsa.unet.RReceiveUDPI;
 import edu.utulsa.unet.UDPSocket;
 
-import java.io.IOException;
+import java.io.*;
 import java.net.DatagramPacket;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.LinkedList;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class RReceiveUDP implements RReceiveUDPI
 {
@@ -161,23 +161,30 @@ public class RReceiveUDP implements RReceiveUDPI
             {
                 byte[] buffer = new byte[socket.getSendBufferSize()];
                 DatagramPacket datagramPacket = new DatagramPacket(buffer, buffer.length);
-                System.out.println("[RECEIVER]Waiting for packet on port " + port);
+//                System.out.println("\n[RECEIVER]Waiting for packet on port " + port);
                 socket.receive(datagramPacket);
                 Packet packet = unpackPacket(datagramPacket.getData());
-                // Check if this packet is already in the list
-                boolean isIn = receivedPackets.contains(packet);
-                if (!isIn)
+//                System.out.println("\n[RECEIVER]Received packet " + decodeSeq(packet.seqNum));
+                if (packet.flag == 2)
                 {
-                    receivedPackets.add(decodeSeq(packet.seqNum) + 1, packet);
+                    packet = reformatPacket(packet, datagramPacket.getLength() - 3);
                 }
-                int seq = decodeSeq(packet.seqNum);
-                System.out.println("[RECEIVER]Received packet " + seq);
-                if (seq == lastReceivedPacket + 1)
+                addToList(packet);
+                int ackSeq = getACKToSend();
+                if (ackSeq != -1)
                 {
-                    lastReceivedPacket++;
-                    byte [] ACK = createACK(("").getBytes(), seq);
+                    byte [] ACK = createACK(("").getBytes(), ackSeq);
+//                    System.out.println("\n[RECEIVER]Sending ack " + ackSeq);
                     socket.send(new DatagramPacket(ACK, ACK.length, datagramPacket.getAddress(), datagramPacket.getPort()));
                 }
+                lastReceivedPacketLock.lock();
+                if (receivedPackets.get(receivedPackets.size()-1).flag == 2 && getACKToSend() == receivedPackets.size()-1)
+                {
+                    lastReceivedPacketLock.unlock();
+//                    System.out.println("\n[RECEIVER]Exiting");
+                    break;
+                }
+                lastReceivedPacketLock.unlock();
             }
         }
         catch (SocketException e)
@@ -188,7 +195,107 @@ public class RReceiveUDP implements RReceiveUDPI
         {
             e.printStackTrace();
         }
+        writeToFile();
         return false;
+    }
+
+    /***
+     * This method adds the packet item to the appropriate spot in the list and if necessary fills any leading values with null.
+     * @param packet to add to the list
+     */
+    private void addToList(Packet packet)
+    {
+        int ind = decodeSeq(packet.seqNum);
+        // Packet is not in the list
+        if (!receivedPackets.contains(packet))
+        {
+            // case 1: just add packet to head of the list
+            if (ind == receivedPackets.size())
+            {
+                receivedPackets.add(packet);
+            }
+            // case 2: the packet needs to be inserted into a null value in the list
+            else if (ind < receivedPackets.size())
+            {
+                receivedPackets.set(ind, packet);
+            }
+            // case 3: the packet needs to be inserted in a future value and all leading values must be filled with nulls
+            else
+            {
+                for (int i = receivedPackets.size(); i < ind; i++)
+                {
+                    receivedPackets.add(i, null);
+                }
+                receivedPackets.add(ind, packet);
+            }
+        }
+    }
+
+    /***
+     * This method gets the appropriate sequence number to ack or -1 if it shouldn't ack anything.
+     * @return int represents sequence number to ack or -1
+     */
+    private int getACKToSend()
+    {
+        // case 1: send no ack
+        if (receivedPackets.size() == 0 || receivedPackets.get(0) == null)
+        {
+            return -1;
+        }
+        // case 2: send ack of highest values before a null value
+        int i = 0;
+        for (i = 0; i < receivedPackets.size(); i++)
+        {
+            if (receivedPackets.get(i) == null)
+            {
+                break;
+            }
+        }
+        lastReceivedPacketLock.lock();
+        lastReceivedPacket = --i;
+        lastReceivedPacketLock.unlock();
+        return i;
+    }
+
+    private void writeToFile()
+    {
+        File file = new File(filename);
+        try
+        {
+            OutputStream os = new FileOutputStream(file);
+            for (Packet receivedPacket : receivedPackets)
+            {
+                for (byte datum : receivedPacket.data)
+                {
+                    os.write(datum);
+                }
+            }
+        }
+        catch (FileNotFoundException e)
+        {
+            e.printStackTrace();
+        }
+        catch (IOException e)
+        {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * This method reformats the last packet to truncate trailing 0's
+     * @param packet
+     * @param length
+     * @return
+     */
+    private Packet reformatPacket(Packet packet, int length)
+    {
+        byte [] data = new byte[length];
+        System.arraycopy(packet.data, 0, data, 0, length);
+        Packet rPacket = new Packet(length);
+        rPacket.flag = packet.flag;
+        rPacket.seqNum = packet.seqNum;
+        rPacket.data = data;
+        return rPacket;
     }
 
 
@@ -202,4 +309,5 @@ public class RReceiveUDP implements RReceiveUDPI
     private String filename = null;
     private ArrayList<Packet> receivedPackets;
     private final int SEQSIZE = 2;
+    private ReentrantLock lastReceivedPacketLock = new ReentrantLock();
 }

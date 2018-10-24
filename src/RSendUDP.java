@@ -2,10 +2,12 @@ import java.net.DatagramPacket;
 import java.io.*;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.concurrent.locks.ReentrantLock;
 
 import edu.utulsa.unet.RSendUDPI;
 import edu.utulsa.unet.UDPSocket;
@@ -48,6 +50,17 @@ public class RSendUDP implements RSendUDPI
         System.arraycopy(seq, 0, packet, 1, seq.length);
         System.arraycopy(data, 0, packet, seq.length + 1, data.length);
         return packet;
+    }
+
+    /***
+     * This method decodes a 2 byte array as an unsigned int then signs it so we don't have problems with having a leading 1.
+     * @param b1
+     * @param b2
+     * @return signed sequence number.
+     */
+    private int decodeSeq(byte b1, byte b2)
+    {
+        return (((b1 & 0xff) << 8) | (b2 & 0xff));
     }
 
     @Override
@@ -150,13 +163,13 @@ public class RSendUDP implements RSendUDPI
     {
         if (filename == null )//|| receiver == null)
         {
-            System.out.println("No file or receiver specified.");
+//            System.out.println("\n[SENDER]No file and/or receiver specified.");
             return false;
         }
         File file = new File(filename);
         try
         {
-            UDPSocket socket = new UDPSocket(2024);
+            UDPSocket socket = new UDPSocket(port);
 
             // read entire file into byte buffer. This should be changed so you don't have to read the entire file into memory.
             byte [] fileBuffer = Files.readAllBytes(file.toPath());
@@ -166,44 +179,69 @@ public class RSendUDP implements RSendUDPI
             allPackets = new ArrayList<>();
             for (int i = 0; i < numberOfPackets; i++)
             {
-                // case 0 where we are at the beginning or the middle of a file
+                // case 1: where we are at the beginning or the middle of the file
                 if ((i + 1) * (dataSize) <= fileSize)
                 {
                     byte [] temp = new byte[dataSize];
                     System.arraycopy(fileBuffer, i * dataSize, temp, 0, temp.length);
                     allPackets.add(packPacket(temp, i, 0));
                 }
-                // case 1 where this is the last packet of the file
+                // case 2: where this is the last packet of the file
                 else
                 {
                     byte [] temp = new byte[(int)fileSize - (i * dataSize)];
                     System.arraycopy(fileBuffer, i * dataSize, temp, 0, temp.length);
-                    allPackets.add(packPacket(temp, i, 0));
+                    allPackets.add(packPacket(temp, i, 2)); // set flag to 2 to mean this is the last packet of the file
                 }
             }
-            outstandingFrames = (int) ((float)windowSize / packetSize);
+            outstandingFrames = mode == 1 ? (int)((float)windowSize/socket.getSendBufferSize()) : 1;
             int headPntr = 0;
-            boolean isReceived = true;
-            while (headPntr < allPackets.size())
+
+            // start ack listener
+            new Thread()
             {
+                public void run()
+                {
+                    ACKListener(socket);
+                }
+            }.start();
+
+            // start sending packets
+            while (true)
+            {
+                lastReceivedLock.lock();
+                if (lastReceived >= allPackets.size() - 1)
+                {
+                    lastReceivedLock.unlock();
+                    break;
+                }
+                lastReceivedLock.unlock();
                 for (int i = 0; i < outstandingFrames; i++)
                 {
-                    if (headPntr + i >= numberOfPackets)
+                    if (headPntr + i >= numberOfPackets || headPntr + i <= packetsSentUpTo)
                     {
                         continue;
                     }
                     byte [] temp = allPackets.get(headPntr + i);
-                    socket.send(new DatagramPacket(temp, temp.length, InetAddress.getByName(ip), port));
-                    System.out.println("Sent packet " + i);
+                    DatagramPacket dpacket = new DatagramPacket(temp, temp.length, receiver.getAddress(), receiver.getPort());
+//                    System.out.println("\n[SENDER]Sending packet " + (headPntr + i));
+                    socketLock.lock();
+                    socket.send(dpacket);
+                    socketLock.unlock();
+                    packetsSentUpTo = headPntr + i;
+
+                    // start timer thread
+                    new Thread()
+                    {
+                        public void run()
+                        {
+                            timer(socket, dpacket);
+                        }
+                    }.start();
                 }
-                byte [] buffer = new byte[ACKSIZE];
-                DatagramPacket ack = new DatagramPacket(buffer, buffer.length);
-                socket.receive(ack);
-                System.out.println("Received ack");
-                if (isReceived)
-                {
-                    ++headPntr;
-                }
+                lastReceivedLock.lock();
+                headPntr = lastReceived != -1 ? lastReceived + 1 : 0;
+                lastReceivedLock.unlock();
             }
         }
         catch (IOException e)
@@ -211,23 +249,100 @@ public class RSendUDP implements RSendUDPI
             e.printStackTrace();
             return false;
         }
+//        System.out.println("\n[SENDER]Exiting");
+        isTransmissionComplete = true;
         return true;
+    }
+
+    /***
+     * This method is used by one ACK receiver thread updating the
+     * @param socket
+     */
+    private void ACKListener(UDPSocket socket)
+    {
+        while (true)
+        {
+            try
+            {
+                DatagramPacket pckt = new DatagramPacket(new byte[ACKSIZE], ACKSIZE);
+//                System.out.println("\n[ACK LISTENER]Listening for ack");
+                socket.receive(pckt);
+                lastReceivedLock.lock();
+                lastReceived = decodeSeq(pckt.getData()[1], pckt.getData()[2]);
+                lastReceivedLock.unlock();
+//                System.out.println("\n[ACK LISTENER]Received ack " + decodeSeq(pckt.getData()[1], pckt.getData()[2]));
+                isTransmissionComplete = decodeSeq(pckt.getData()[1], pckt.getData()[2]) == allPackets.size()-1;
+                if (isTransmissionComplete)
+                {
+//                    System.out.println("\n[ACK LISTENER]Exiting");
+                    Thread.currentThread().stop();
+                }
+            }
+            catch (IOException e)
+            {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    /***
+     * This method should be called with a new thread for each packet. It will sleep for the timeout time
+     * then it will check if an ack for the packet has been received if not it will resend the packet and sleep again.
+     * @param socket
+     * @param packet
+     */
+    private void timer(UDPSocket socket, DatagramPacket packet)
+    {
+//        System.out.println("[TIMER]Timer started for packet " + decodeSeq(packet.getData()[1], packet.getData()[2]));
+        while (true)
+        {
+            try
+            {
+                Thread.sleep(timeout);
+            }
+            catch (InterruptedException e)
+            {
+                e.printStackTrace();
+            }
+            if (lastReceived >= decodeSeq(packet.getData()[1], packet.getData()[2]))
+            {
+//                System.out.println("[TIMER]Packet " + decodeSeq(packet.getData()[1], packet.getData()[2]) + " received killing timer.");
+                Thread.currentThread().stop();
+                throw new RuntimeException();
+            }
+            socketLock.lock();
+            try
+            {
+//                System.out.println("[TIMER]Resending packet " + decodeSeq(packet.getData()[1], packet.getData()[2]));
+                socket.send(packet);
+            }
+            catch (IOException e)
+            {
+                e.printStackTrace();
+            }
+            finally
+            {
+                socketLock.unlock();
+            }
+        }
     }
 
 
     // Globals:
     private int mode = 0;
-    private int packetSize;
     private int port = 12987;
     private long timeout = 1000;
     private long windowSize = 256;
     private int outstandingFrames = 1;
-    private int received = -1;
+    private int lastReceived = -1;
+    private int packetsSentUpTo = -1;
     private String ip = "localhost";
     private String filename = null;
     private InetSocketAddress receiver = null;
     private ArrayList<byte []> allPackets = null;
     private final int SEQSIZE = 2;
     private final int ACKSIZE = 4;
-
+    private boolean isTransmissionComplete = false;
+    private ReentrantLock socketLock = new ReentrantLock();
+    private ReentrantLock lastReceivedLock = new ReentrantLock();
 }
